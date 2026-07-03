@@ -191,10 +191,10 @@ Thanks to [linux.do](https://linux.do) — a vibrant tech community where this p
 
 ## Star History
 
-<a href="https://star-history.com/#AaronL725/grok-register&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=AaronL725/grok-register&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=AaronL725/grok-register&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=AaronL725/grok-register&type=Date" />
-  </picture>
+<a href="https://www.star-history.com/?repos=AaronL725%2Fgrok-register&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=AaronL725/grok-register&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=AaronL725/grok-register&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=AaronL725/grok-register&type=date&legend=top-left" />
+ </picture>
 </a>
