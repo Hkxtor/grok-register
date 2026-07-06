@@ -13,6 +13,16 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
   <a href="https://linux.do"><img src="https://img.shields.io/badge/Join-linux.do-orange" alt="linux.do"></a>
 </p>
 
+<p align="center">
+ <a href="https://www.star-history.com/aaronl725/grok-register">
+  <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/badge?repo=AaronL725/grok-register&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/badge?repo=AaronL725/grok-register" />
+   <img alt="Star History Rank" src="https://api.star-history.com/badge?repo=AaronL725/grok-register" />
+  </picture>
+ </a>
+</p>
+
 </div>
 
 ---
