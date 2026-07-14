@@ -1,0 +1,31 @@
+name: Temporary final flow fixes
+
+on:
+  push:
+    paths:
+      - tools/apply_final_flow_fixes.py
+      - .github/workflows/temp-final-flow-fixes.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply final flow fixes
+        run: python tools/apply_final_flow_fixes.py
+      - name: Verify syntax
+        run: python -m compileall -q grok_register_ttk.py registration_flow.py cpa_xai tests
+      - name: Run focused unit tests
+        run: python -m unittest tests.test_grok2api_remote_pool tests.test_registration_flow
+      - name: Commit changes and cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f tools/apply_final_flow_fixes.py .github/workflows/temp-final-flow-fixes.yml
+          git add -A
+          git commit -m "fix: finish shared registration flow hardening"
+          git push
