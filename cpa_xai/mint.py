@@ -20,6 +20,8 @@ def mint_and_export(
     recycle_every=15,
     log=None,
     cancel=None,
+    request_timeout_sec=15.0,
+    poll_timeout_sec=15.0,
 ):
     logger = log or (lambda message: None)
     email = str(email or "").strip()
@@ -40,6 +42,8 @@ def mint_and_export(
             cookies=cookies,
             reuse_browser=bool(reuse_browser),
             recycle_every=int(recycle_every or 0),
+            request_timeout_sec=float(request_timeout_sec),
+            poll_timeout_sec=float(poll_timeout_sec),
         )
     except Exception as exc:
         logger("mint failed: %s" % exc)

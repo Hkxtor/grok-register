@@ -37,6 +37,7 @@ import socketserver
 import ssl
 import urllib.parse
 import tempfile
+import traceback
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -90,6 +91,9 @@ DEFAULT_CONFIG = {
     "cpa_force_standalone": True,
     "cpa_mint_timeout_sec": 300,
     "cpa_mint_cookie_inject": True,
+    "cpa_oidc_request_timeout_sec": 15,
+    "cpa_oidc_poll_timeout_sec": 15,
+    "grok2api_allow_legacy_full_save": False,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -109,23 +113,103 @@ class ConfigError(RuntimeError):
     pass
 
 
+class RemoteTokenCompatibilityError(RuntimeError):
+    pass
+
+
+class RemoteTokenRequestError(RuntimeError):
+    pass
+
+
+def log_exception(context, exc, log_callback=None):
+    message = f"{context}: {exc.__class__.__name__}: {exc}"
+    if log_callback:
+        log_callback(f"[!] {message}")
+    else:
+        print(f"[!] {message}", file=sys.stderr)
+    return message
+
+
+def _require_bool(cfg, key):
+    value = cfg.get(key)
+    if type(value) is not bool:
+        raise ConfigError(f"配置项 {key} 必须是布尔值 true/false")
+    return value
+
+
+def _require_int(cfg, key, minimum, maximum):
+    value = cfg.get(key)
+    if type(value) is not int:
+        raise ConfigError(f"配置项 {key} 必须是整数")
+    if not minimum <= value <= maximum:
+        raise ConfigError(f"配置项 {key} 必须在 {minimum} 到 {maximum} 之间")
+    return value
+
+
+def _require_string(cfg, key, path=False):
+    value = cfg.get(key)
+    if not isinstance(value, str):
+        raise ConfigError(f"配置项 {key} 必须是字符串")
+    value = value.strip() if key not in ("user_agent",) else value
+    if "\x00" in value:
+        raise ConfigError(f"配置项 {key} 包含非法空字符")
+    if path and value:
+        os.path.expanduser(value)
+    return value
+
+
+def validate_config(raw):
+    if not isinstance(raw, dict):
+        raise ConfigError("config root must be a JSON object")
+    cfg = {**DEFAULT_CONFIG, **raw}
+    bool_keys = (
+        "enable_nsfw", "grok2api_auto_add_local", "grok2api_auto_add_remote",
+        "grok2api_allow_legacy_full_save", "cpa_export_enabled",
+        "cpa_copy_to_hotload", "cpa_headless", "cpa_force_standalone",
+        "cpa_mint_cookie_inject",
+    )
+    for key in bool_keys:
+        cfg[key] = _require_bool(cfg, key)
+    cfg["register_count"] = _require_int(cfg, "register_count", 1, 2500)
+    cfg["cpa_mint_timeout_sec"] = _require_int(cfg, "cpa_mint_timeout_sec", 30, 1800)
+    cfg["cpa_oidc_request_timeout_sec"] = _require_int(cfg, "cpa_oidc_request_timeout_sec", 3, 120)
+    cfg["cpa_oidc_poll_timeout_sec"] = _require_int(cfg, "cpa_oidc_poll_timeout_sec", 3, 120)
+    string_keys = tuple(key for key, value in DEFAULT_CONFIG.items() if isinstance(value, str))
+    path_keys = {"grok2api_local_token_file", "api_reverse_tools", "cpa_auth_dir", "cpa_hotload_dir"}
+    for key in string_keys:
+        cfg[key] = _require_string(cfg, key, path=key in path_keys)
+    enums = {
+        "email_provider": {"duckmail", "yyds", "cloudflare", "cloudmail"},
+        "cloudflare_auth_mode": {"query-key", "bearer", "x-api-key", "x-admin-auth", "none"},
+        "grok2api_pool_name": {"ssoBasic", "ssoSuper"},
+    }
+    for key, allowed in enums.items():
+        value = cfg.get(key, DEFAULT_CONFIG.get(key, ""))
+        if value not in allowed:
+            raise ConfigError(f"配置项 {key} 的值无效: {value!r}; 允许值: {sorted(allowed)}")
+        cfg[key] = value
+    return cfg
+
+
 def load_config():
     global config
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            if not isinstance(loaded, dict):
-                raise ValueError("config root must be a JSON object")
-            config = {**DEFAULT_CONFIG, **loaded}
+            config = validate_config(loaded)
+        except ConfigError:
+            raise
         except Exception as exc:
             raise ConfigError(f"配置文件解析失败: {CONFIG_FILE}: {exc}") from exc
     else:
-        config = DEFAULT_CONFIG.copy()
+        config = validate_config(DEFAULT_CONFIG.copy())
     return config
 
 
 def save_config():
+    global config
+    config = validate_config(config)
     config_dir = os.path.dirname(os.path.abspath(CONFIG_FILE))
     os.makedirs(config_dir, exist_ok=True)
     fd = None
@@ -197,8 +281,6 @@ def warn_runtime_compatibility():
 
 ensure_stable_python_runtime()
 warn_runtime_compatibility()
-
-load_config()
 
 EXTENSION_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "turnstilePatch")
@@ -819,106 +901,109 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
         return False
     base = str(config.get("grok2api_remote_base", "") or "").strip().rstrip("/")
     app_key = str(config.get("grok2api_remote_app_key", "") or "").strip()
-    pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip() or "ssoBasic"
+    pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip()
     if not base or not app_key:
-        if log_callback:
-            log_callback("[Debug] grok2api 远端未配置 base/app_key，跳过")
-        return False
+        raise RemoteTokenRequestError("grok2api 远端未配置 base/app_key")
     headers = {"Content-Type": "application/json"}
     query = {"app_key": app_key}
-    pool_map = {"ssoBasic": "basic", "ssoSuper": "super"}
-    remote_pool = pool_map.get(pool_name, "basic")
+    remote_pool = {"ssoBasic": "basic", "ssoSuper": "super"}[pool_name]
     api_bases = get_grok2api_remote_api_bases(base)
-    add_errors = []
-    # 优先使用 add 接口，避免全量覆盖远端池
+    incompatible = []
     add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}
     for api_base in api_bases:
         endpoint = f"{api_base}/tokens/add"
         try:
-            resp_add = http_post(
-                endpoint,
-                headers=headers,
-                params=query,
-                json=add_payload,
-                timeout=30,
-            )
-            resp_add.raise_for_status()
+            response = http_post(endpoint, headers=headers, params=query, json=add_payload, timeout=30)
+        except Exception as exc:
+            raise RemoteTokenRequestError(f"远端 /tokens/add 网络请求失败: {endpoint}: {exc}") from exc
+        status = int(getattr(response, "status_code", 0) or 0)
+        if 200 <= status < 300:
             if log_callback:
                 log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({endpoint})")
             return True
-        except Exception as add_exc:
-            add_errors.append(f"{endpoint}: {add_exc}")
-    if log_callback:
-        log_callback(f"[Debug] /tokens/add 写入失败，尝试 /tokens 全量模式: {'; '.join(add_errors)}")
-
-    # 兜底：旧版全量保存接口。必须先成功读取远端旧状态，避免空池覆盖。
-    current = {}
-    fallback_base = api_bases[0] if api_bases else base
-    loaded_remote_state = False
+        if status in (404, 405):
+            incompatible.append(f"{endpoint}: HTTP {status}")
+            continue
+        body = str(getattr(response, "text", "") or "")[:300]
+        raise RemoteTokenRequestError(f"远端 /tokens/add 请求失败，不允许全量回退: {endpoint}: HTTP {status}: {body}")
+    if not bool(config.get("grok2api_allow_legacy_full_save", False)):
+        raise RemoteTokenCompatibilityError(
+            "/tokens/add 不受支持，旧版全量保存默认禁用以避免并发覆盖: " + "; ".join(incompatible)
+        )
+    current = None
+    fallback_base = None
+    etag = None
     load_errors = []
     for api_base in api_bases or [base]:
+        endpoint = f"{api_base}/tokens"
         try:
-            resp = http_get(f"{api_base}/tokens", headers=headers, params=query, timeout=20)
-            if resp.status_code == 200:
-                payload = resp.json()
-                if isinstance(payload, dict):
-                    candidate = payload.get("tokens") if "tokens" in payload else payload
-                    if isinstance(candidate, dict):
-                        current = candidate
-                        fallback_base = api_base
-                        loaded_remote_state = True
-                        break
-                load_errors.append(f"{api_base}/tokens: unexpected payload")
-            else:
-                load_errors.append(f"{api_base}/tokens: HTTP {resp.status_code}")
+            response = http_get(endpoint, headers=headers, params=query, timeout=20)
         except Exception as exc:
-            load_errors.append(f"{api_base}/tokens: {exc}")
-    if not loaded_remote_state:
-        raise RuntimeError("无法安全读取远端 token 池，拒绝执行全量覆盖: " + "; ".join(load_errors))
+            raise RemoteTokenRequestError(f"旧版远端池读取网络失败: {endpoint}: {exc}") from exc
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 200:
+            load_errors.append(f"{endpoint}: HTTP {status}")
+            continue
+        payload = response.json()
+        candidate = payload.get("tokens") if isinstance(payload, dict) and "tokens" in payload else payload
+        if not isinstance(candidate, dict):
+            load_errors.append(f"{endpoint}: unexpected payload")
+            continue
+        current = candidate
+        fallback_base = api_base
+        response_headers = getattr(response, "headers", {}) or {}
+        etag = response_headers.get("ETag") or response_headers.get("etag")
+        break
+    if current is None or fallback_base is None:
+        raise RemoteTokenRequestError("无法安全读取旧版远端 token 池: " + "; ".join(load_errors))
     pool = current.get(pool_name)
     if pool is None:
         pool = []
     elif not isinstance(pool, list):
-        raise RuntimeError(f"远端 token 池 {pool_name} 不是列表，拒绝全量覆盖")
-    existing = set()
-    for item in pool:
-        if isinstance(item, str):
-            existing.add(_normalize_sso_token(item))
-        elif isinstance(item, dict):
-            existing.add(_normalize_sso_token(item.get("token", "")))
+        raise RemoteTokenRequestError(f"远端 token 池 {pool_name} 不是列表，拒绝全量覆盖")
+    existing = {
+        _normalize_sso_token(item if isinstance(item, str) else item.get("token", ""))
+        for item in pool if isinstance(item, (str, dict))
+    }
     if token not in existing:
         pool.append({"token": token, "tags": ["auto-register"], "note": email})
     current[pool_name] = pool
-    save_errors = []
-    save_bases = []
-    for item in [fallback_base, *(api_bases or [base])]:
-        if item and item not in save_bases:
-            save_bases.append(item)
-    for api_base in save_bases:
-        try:
-            resp2 = http_post(f"{api_base}/tokens", headers=headers, params=query, json=current, timeout=30)
-            resp2.raise_for_status()
-            if log_callback:
-                log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({api_base}/tokens)")
-            return True
-        except Exception as save_exc:
-            save_errors.append(f"{api_base}/tokens: {save_exc}")
-    raise RuntimeError(f"grok2api 远端 /tokens 全量模式写入失败: {'; '.join(save_errors)}")
+    save_headers = dict(headers)
+    if etag:
+        save_headers["If-Match"] = etag
+    elif log_callback:
+        log_callback("[!] 旧版远端接口未提供 ETag；已由显式配置允许，但仍不建议多实例并发")
+    endpoint = f"{fallback_base}/tokens"
+    try:
+        response = http_post(endpoint, headers=save_headers, params=query, json=current, timeout=30)
+    except Exception as exc:
+        raise RemoteTokenRequestError(f"旧版远端池保存网络失败: {endpoint}: {exc}") from exc
+    status = int(getattr(response, "status_code", 0) or 0)
+    if not 200 <= status < 300:
+        raise RemoteTokenRequestError(f"旧版远端池保存失败: {endpoint}: HTTP {status}")
+    if log_callback:
+        log_callback(f"[+] 已写入 grok2api 远端池（旧版兼容）: {pool_name} ({endpoint})")
+    return True
 
 
 def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
-    if config.get("grok2api_auto_add_local", True):
+    result = {
+        "local": {"enabled": bool(config.get("grok2api_auto_add_local", False)), "ok": None, "error": None},
+        "remote": {"enabled": bool(config.get("grok2api_auto_add_remote", False)), "ok": None, "error": None},
+    }
+    if result["local"]["enabled"]:
         try:
-            add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback)
+            result["local"]["ok"] = bool(add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback))
         except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] 写入 grok2api 本地池失败: {exc}")
-    if config.get("grok2api_auto_add_remote", False):
+            result["local"]["ok"] = False
+            result["local"]["error"] = log_exception("写入 grok2api 本地池失败", exc, log_callback)
+    if result["remote"]["enabled"]:
         try:
-            add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback)
+            result["remote"]["ok"] = bool(add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback))
         except Exception as exc:
-            if log_callback:
-                log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+            result["remote"]["ok"] = False
+            result["remote"]["error"] = log_exception("写入 grok2api 远端池失败", exc, log_callback)
+    return result
 
 
 def apply_browser_proxy_option(options, proxy):
@@ -3120,6 +3205,84 @@ def maybe_export_cpa_xai_after_success(email, password, sso="", log_callback=Non
     return result
 
 
+
+def _save_mail_credential(email, credential, log_callback=None):
+    path = os.path.join(os.path.dirname(__file__), "mail_credentials.txt")
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"{email}\t{credential}\n")
+            handle.flush()
+        return True
+    except Exception as exc:
+        log_exception("保存邮箱凭据失败", exc, log_callback)
+        return False
+
+
+def _append_account_line(path, email, password, sso):
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"{email}----{password}----{sso}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _queue_unsaved_account(path, payload, error, log_callback=None):
+    pending_path = path + ".pending.jsonl"
+    record = dict(payload)
+    record["save_error"] = str(error)
+    record["queued_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        with open(pending_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(pending_path, 0o600)
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        log_exception("写入账号 pending 队列失败", exc, log_callback)
+        return False
+
+
+def run_registration_common(count, log_callback, cancel_callback, accounts_output_file, observer):
+    from registration_flow import RegistrationCallbacks, RegistrationOperations, run_batch
+    callbacks = RegistrationCallbacks(log=log_callback, cancelled=cancel_callback)
+    operations = RegistrationOperations(
+        start_browser=lambda: start_browser(log_callback=log_callback),
+        restart_browser=lambda: restart_browser(log_callback=log_callback),
+        browser_missing=lambda: browser is None,
+        open_signup_page=lambda: open_signup_page(log_callback=log_callback, cancel_callback=cancel_callback),
+        fill_email_and_submit=lambda: fill_email_and_submit(log_callback=log_callback, cancel_callback=cancel_callback),
+        save_mail_credential=lambda email, token: _save_mail_credential(email, token, log_callback),
+        fill_code_and_submit=lambda email, token: fill_code_and_submit(email, token, log_callback=log_callback, cancel_callback=cancel_callback),
+        fill_profile_and_submit=lambda: fill_profile_and_submit(log_callback=log_callback, cancel_callback=cancel_callback),
+        wait_for_sso_cookie=lambda: wait_for_sso_cookie(log_callback=log_callback, cancel_callback=cancel_callback),
+        enable_nsfw=lambda sso: enable_nsfw_for_token(sso, log_callback=log_callback),
+        persist_account_line=lambda email, password, sso: _append_account_line(accounts_output_file, email, password, sso),
+        queue_unsaved_result=lambda payload, error: _queue_unsaved_account(accounts_output_file, payload, error, log_callback),
+        add_tokens=lambda sso, email: add_token_to_grok2api_pools(sso, email=email, log_callback=log_callback),
+        export_cpa=lambda email, password, sso: maybe_export_cpa_xai_after_success(
+            email=email, password=password, sso=sso,
+            log_callback=log_callback, cancel_callback=cancel_callback,
+        ),
+        cleanup=lambda reason: cleanup_runtime_memory(log_callback=log_callback, reason=reason),
+        sleep=lambda seconds: sleep_with_cancel(seconds, cancel_callback),
+        cancelled_exception=RegistrationCancelled,
+        retry_exception=AccountRetryNeeded,
+    )
+    return run_batch(
+        count=count,
+        callbacks=callbacks,
+        observer=observer,
+        ops=operations,
+        enable_nsfw=bool(config.get("enable_nsfw", True)),
+        cleanup_interval=MEMORY_CLEANUP_INTERVAL,
+        max_slot_retry=3,
+        max_mail_retry=3,
+    )
+
+
 class GrokRegisterGUI:
     def __init__(self, root):
         self.root = root
@@ -3133,9 +3296,9 @@ class GrokRegisterGUI:
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
-        self._ui_thread_id = threading.get_ident()
         self.accounts_output_file = ""
         self.setup_ui()
+        self.root.after(50, self.process_ui_queue)
 
     def setup_ui(self):
         load_config()
@@ -3351,39 +3514,50 @@ class GrokRegisterGUI:
         self.log("[*] GUI 已就绪，配置已加载")
         self.log(f"[*] 当前邮箱服务商: {self.email_provider_var.get()} | 注册数量: {self.count_var.get()}")
 
-    def _call_ui(self, func, *args):
-        if threading.get_ident() == self._ui_thread_id:
-            func(*args)
-            return
+    def process_ui_queue(self):
         try:
-            self.root.after(0, lambda: func(*args))
-        except Exception:
+            while True:
+                event = self.ui_queue.get_nowait()
+                kind = event[0]
+                if kind == "log":
+                    line = event[1]
+                    self.log_text.insert(tk.END, f"{line}\n")
+                    self.log_text.see(tk.END)
+                elif kind == "stats":
+                    self.stats_var.set(f"成功: {event[1]} | 失败: {event[2]}")
+                elif kind == "running":
+                    running = bool(event[1])
+                    self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
+                    self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+                    self.status_var.set("运行中..." if running else "就绪")
+                    self.status_label.config(foreground="blue" if running else "green")
+                elif kind == "error":
+                    messagebox.showerror(event[1], event[2])
+        except queue.Empty:
             pass
-
-    def _append_log_line(self, line):
-        self.log_text.insert(tk.END, f"{line}\n")
-        self.log_text.see(tk.END)
+        except Exception as exc:
+            print(f"[!] UI 队列处理失败: {exc}", file=sys.stderr)
+        finally:
+            try:
+                self.root.after(50, self.process_ui_queue)
+            except Exception:
+                pass
 
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
         print(line, flush=True)
-        self._call_ui(self._append_log_line, line)
+        self.ui_queue.put(("log", line))
 
     def clear_log(self):
-        self._call_ui(lambda: self.log_text.delete(1.0, tk.END))
+        self.log_text.delete(1.0, tk.END)
 
     def update_stats(self):
-        self._call_ui(lambda: self.stats_var.set(f"成功: {self.success_count} | 失败: {self.fail_count}"))
+        self.ui_queue.put(("stats", self.success_count, self.fail_count))
 
     def _set_running_ui(self, running):
-        self.is_running = running
-        def apply():
-            self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
-            self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
-            self.status_var.set("运行中..." if running else "就绪")
-            self.status_label.config(foreground="blue" if running else "green")
-        self._call_ui(apply)
+        self.is_running = bool(running)
+        self.ui_queue.put(("running", self.is_running))
 
 
     def should_stop(self):
@@ -3471,146 +3645,29 @@ class GrokRegisterGUI:
         self.log("[!] 用户停止注册")
 
     def run_registration(self, count):
+        def observer(batch, account, output):
+            self.success_count = batch.success_count
+            self.fail_count = batch.fail_count
+            if account is not None:
+                self.results.append({"email": account.email, "sso": account.sso, "profile": account.profile, "output": output})
+            self.update_stats()
         try:
-            start_browser(log_callback=self.log)
-            self.log("[*] 浏览器已启动")
-            i = 0
-            retry_count_for_slot = 0
-            max_slot_retry = 3
-            while i < count:
-                if self.should_stop():
-                    break
-                self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-                try:
-                    email = ""
-                    dev_token = ""
-                    code = ""
-                    mail_ok = False
-                    max_mail_retry = 3
-                    for mail_try in range(1, max_mail_retry + 1):
-                        self.log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                        open_signup_page(
-                            log_callback=self.log, cancel_callback=self.should_stop
-                        )
-                        self.log("[*] 2. 创建邮箱并提交")
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=self.log, cancel_callback=self.should_stop
-                        )
-                        self.log(f"[*] 邮箱: {email}")
-                        self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                        try:
-                            with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(f"{email}\t{dev_token}\n")
-                        except Exception:
-                            pass
-                        self.log("[*] 3. 拉取验证码")
-                        try:
-                            code = fill_code_and_submit(
-                                email,
-                                dev_token,
-                                log_callback=self.log,
-                                cancel_callback=self.should_stop,
-                            )
-                            mail_ok = True
-                            break
-                        except Exception as mail_exc:
-                            msg = str(mail_exc)
-                            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                                self.log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                                restart_browser(log_callback=self.log)
-                                sleep_with_cancel(1, self.should_stop)
-                                continue
-                            raise
-
-                    if not mail_ok:
-                        raise Exception("验证码阶段失败，已达到最大重试次数")
-                    self.log(f"[*] 验证码: {code}")
-                    self.log("[*] 4. 填写资料")
-                    profile = fill_profile_and_submit(
-                        log_callback=self.log, cancel_callback=self.should_stop
-                    )
-                    self.log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                    self.log("[*] 5. 等待 sso cookie")
-                    sso = wait_for_sso_cookie(
-                        log_callback=self.log, cancel_callback=self.should_stop
-                    )
-                    if config.get("enable_nsfw", True):
-                        self.log("[*] 6. 开启 NSFW")
-                        nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                            sso, log_callback=self.log
-                        )
-                        if nsfw_ok:
-                            self.log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                        else:
-                            self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                    self.results.append({"email": email, "sso": sso, "profile": profile})
-                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
-                    except Exception as file_exc:
-                        self.log(f"[Debug] 保存账号文件失败: {file_exc}")
-                    add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
-                    maybe_export_cpa_xai_after_success(
-                        email=email,
-                        password=profile.get("password", ""),
-                        sso=sso,
-                        log_callback=self.log,
-                        cancel_callback=self.should_stop,
-                    )
-                    self.success_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    self.log(f"[+] 注册成功: {email}")
-                    if (
-                        self.success_count > 0
-                        and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
-                        and i < count
-                    ):
-                        cleanup_runtime_memory(
-                            log_callback=self.log,
-                            reason=f"已成功 {self.success_count} 个账号，执行定期清理",
-                        )
-                except RegistrationCancelled:
-                    self.log("[!] 注册被用户停止")
-                    break
-                except AccountRetryNeeded as exc:
-                    retry_count_for_slot += 1
-                    if retry_count_for_slot <= max_slot_retry:
-                        self.log(
-                            f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
-                        )
-                    else:
-                        self.fail_count += 1
-                        self.log(
-                            f"[-] 当前账号已达到最大重试次数，跳过: {exc}"
-                        )
-                        retry_count_for_slot = 0
-                        i += 1
-                except Exception as exc:
-                    self.fail_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    self.log(f"[-] 注册失败: {exc}")
-                finally:
-                    self.update_stats()
-                    if self.should_stop():
-                        break
-                    if browser is None:
-                        start_browser(log_callback=self.log)
-                    else:
-                        restart_browser(log_callback=self.log)
-                    sleep_with_cancel(1, self.should_stop)
+            batch = run_registration_common(
+                count=count,
+                log_callback=self.log,
+                cancel_callback=self.should_stop,
+                accounts_output_file=self.accounts_output_file,
+                observer=observer,
+            )
+            self.success_count = batch.success_count
+            self.fail_count = batch.fail_count
         except Exception as exc:
-            self.log(f"[!] 任务异常: {exc}")
+            log_exception("任务异常", exc, self.log)
         finally:
-            cleanup_runtime_memory(log_callback=self.log, reason="任务结束")
             self._set_running_ui(False)
             self.log("[*] 任务结束")
+
+
 
 
 class CliStopController:
@@ -3631,149 +3688,34 @@ def cli_log(message):
 
 def run_registration_cli(count):
     controller = CliStopController()
-    success_count = 0
-    fail_count = 0
-    retry_count_for_slot = 0
-    max_slot_retry = 3
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
+    last_stats = {"success": 0, "fail": 0}
+    def observer(batch, account, output):
+        last_stats["success"] = batch.success_count
+        last_stats["fail"] = batch.fail_count
+        cli_log(f"[*] 当前统计: 成功 {batch.success_count} | 失败 {batch.fail_count}")
     try:
-        start_browser(log_callback=cli_log)
-        cli_log("[*] 浏览器已启动")
-        i = 0
-        while i < count:
-            if controller.should_stop():
-                break
-            cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
-            try:
-                email = ""
-                dev_token = ""
-                code = ""
-                mail_ok = False
-                max_mail_retry = 3
-                for mail_try in range(1, max_mail_retry + 1):
-                    cli_log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                    open_signup_page(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log("[*] 2. 创建邮箱并提交")
-                    email, dev_token = fill_email_and_submit(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log(f"[*] 邮箱: {email}")
-                    cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
-                    try:
-                        with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(f"{email}\t{dev_token}\n")
-                    except Exception:
-                        pass
-                    cli_log("[*] 3. 拉取验证码")
-                    try:
-                        code = fill_code_and_submit(
-                            email,
-                            dev_token,
-                            log_callback=cli_log,
-                            cancel_callback=controller.should_stop,
-                        )
-                        mail_ok = True
-                        break
-                    except Exception as mail_exc:
-                        msg = str(mail_exc)
-                        if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                            cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                            restart_browser(log_callback=cli_log)
-                            sleep_with_cancel(1, controller.should_stop)
-                            continue
-                        raise
-
-                if not mail_ok:
-                    raise Exception("验证码阶段失败，已达到最大重试次数")
-                cli_log(f"[*] 验证码: {code}")
-                cli_log("[*] 4. 填写资料")
-                profile = fill_profile_and_submit(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
-                cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                cli_log("[*] 5. 等待 sso cookie")
-                sso = wait_for_sso_cookie(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
-                if config.get("enable_nsfw", True):
-                    cli_log("[*] 6. 开启 NSFW")
-                    nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, log_callback=cli_log
-                    )
-                    if nsfw_ok:
-                        cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                    else:
-                        cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as file_exc:
-                    cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
-                add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
-                maybe_export_cpa_xai_after_success(
-                    email=email,
-                    password=profile.get("password", ""),
-                    sso=sso,
-                    log_callback=cli_log,
-                    cancel_callback=controller.should_stop,
-                )
-                success_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[+] 注册成功: {email}")
-                cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
-                if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
-                    cleanup_runtime_memory(
-                        log_callback=cli_log,
-                        reason=f"已成功 {success_count} 个账号，执行定期清理",
-                    )
-            except RegistrationCancelled:
-                cli_log("[!] 注册被停止")
-                break
-            except AccountRetryNeeded as exc:
-                retry_count_for_slot += 1
-                if retry_count_for_slot <= max_slot_retry:
-                    cli_log(
-                        f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
-                    )
-                else:
-                    fail_count += 1
-                    retry_count_for_slot = 0
-                    i += 1
-                    cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
-            except Exception as exc:
-                fail_count += 1
-                retry_count_for_slot = 0
-                i += 1
-                cli_log(f"[-] 注册失败: {exc}")
-            finally:
-                if controller.should_stop():
-                    break
-                if browser is None:
-                    start_browser(log_callback=cli_log)
-                else:
-                    restart_browser(log_callback=cli_log)
-                sleep_with_cancel(1, controller.should_stop)
+        batch = run_registration_common(
+            count=count,
+            log_callback=cli_log,
+            cancel_callback=controller.should_stop,
+            accounts_output_file=accounts_output_file,
+            observer=observer,
+        )
+        last_stats["success"] = batch.success_count
+        last_stats["fail"] = batch.fail_count
     except KeyboardInterrupt:
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止并清理")
     except Exception as exc:
-        cli_log(f"[!] 任务异常: {exc}")
+        log_exception("任务异常", exc, cli_log)
     finally:
-        cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")
-        cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
+        cli_log(f"[*] 任务结束。成功 {last_stats['success']} | 失败 {last_stats['fail']}")
 
 
 def main_cli():

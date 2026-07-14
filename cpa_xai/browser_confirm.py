@@ -193,6 +193,7 @@ def create_standalone_page(proxy: Optional[str] = None, headless: bool = False, 
 
     resolved = resolve_proxy(proxy)
     proxy_bridge = None
+    browser = None
     chrome_proxy, proxy_bridge = prepare_chromium_proxy(resolved, log=logger)
     try:
         if chrome_proxy:
@@ -200,19 +201,17 @@ def create_standalone_page(proxy: Optional[str] = None, headless: bool = False, 
             logger("browser proxy=%s (chromium %s)" % (proxy_log_label(resolved), chrome_proxy))
         else:
             logger("browser proxy=(none)")
-
         browser = Chromium(options)
         if proxy_bridge is not None:
-            try:
-                setattr(browser, "_cpa_proxy_bridge", proxy_bridge)
-            except Exception:
-                pass
-        _register_mint_browser(browser)
+            setattr(browser, "_cpa_proxy_bridge", proxy_bridge)
         page = browser.latest_tab
+        _register_mint_browser(browser)
         logger("standalone chromium started")
         return browser, page
     except Exception:
-        if proxy_bridge is not None:
+        if browser is not None:
+            close_standalone(browser)
+        elif proxy_bridge is not None:
             try:
                 proxy_bridge.stop()
             except Exception:
@@ -846,6 +845,8 @@ def mint_with_browser(
     cookies: Any = None,
     reuse_browser: bool = True,
     recycle_every: int = 15,
+    request_timeout_sec: float = 15.0,
+    poll_timeout_sec: float = 15.0,
 ):
     from .oauth_device import OAuthDeviceError, poll_device_token, request_device_code
     from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
@@ -858,19 +859,12 @@ def mint_with_browser(
     set_runtime_proxy(resolved or None)
     success = False
     try:
-        last_error = None
-        session = None
-        for attempt in range(1, 4):
-            try:
-                session = request_device_code(proxy=resolved or None)
-                last_error = None
-                break
-            except Exception as exc:
-                last_error = exc
-                logger("request_device_code attempt %s/3 failed: %s" % (attempt, exc))
-                _sleep(1.5 * attempt)
-        if session is None:
-            raise last_error or RuntimeError("request_device_code failed")
+        session = request_device_code(
+            proxy=resolved or None,
+            timeout=float(request_timeout_sec),
+            cancel=cancel,
+            retries=2,
+        )
         logger("device user_code=%s expires_in=%s proxy=%s" % (session.user_code, session.expires_in, proxy_log_label(resolved) or "(none)"))
         if work_page is None:
             own_browser, work_page, owned = acquire_mint_browser(
@@ -910,6 +904,7 @@ def mint_with_browser(
                     log=logger,
                     cancel=combined_cancel,
                     proxy=resolved or None,
+                    timeout=float(poll_timeout_sec),
                 )
                 token_box["token"] = result
                 stop_event.set()
