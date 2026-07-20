@@ -488,23 +488,59 @@ def duckmail_get_oai_code(
         sleep_with_cancel(poll_interval, cancel_callback)
     raise Exception(f"在 {timeout}s 内未收到验证码邮件")
 
+def _looks_like_hyphen_code(token):
+    """Reject CSS/noise tokens like per-100; keep real codes like VJ6-YE7."""
+    parts = str(token or "").split("-", 1)
+    if len(parts) != 2:
+        return False
+    left, right = parts
+    if len(left) != 3 or len(right) != 3:
+        return False
+    # Each side must mix letters and digits (xAI style), not word-only or digit-only.
+    def mixed(part):
+        return any(ch.isalpha() for ch in part) and any(ch.isdigit() for ch in part)
+    return mixed(left) and mixed(right)
+
+
 def extract_verification_code(text, subject=""):
+    """Extract signup verification codes; prefer labeled matches over bare tokens."""
+    subject = str(subject or "")
+    text = str(text or "")
+    # Subject first so Cloud Mail titles like
+    # "SpaceXAI confirmation code: VJ6-YE7" beat body noise such as per-100.
+    haystacks = [subject, text] if subject else [text]
+    labeled_patterns = [
+        r"(?:verification|confirm(?:ation)?)\s+code[:\s]+([A-Z0-9]{3}-[A-Z0-9]{3})",
+        r"(?:verification|confirm(?:ation)?)\s+code[:\s]+(\d{4,8})",
+        r"your\s+code[:\s]+([A-Z0-9]{3}-[A-Z0-9]{3})",
+        r"your\s+code[:\s]+(\d{4,8})",
+    ]
+    for haystack in haystacks:
+        if not haystack:
+            continue
+        for pattern in labeled_patterns:
+            match = re.search(pattern, haystack, re.IGNORECASE)
+            if not match:
+                continue
+            token = match.group(1)
+            # Labeled digit codes are accepted as-is; hyphen tokens still need
+            # quality filtering so "confirmation code: per-100" is ignored.
+            if "-" in token and not _looks_like_hyphen_code(token):
+                continue
+            return token
+
     if subject:
         match = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", subject, re.IGNORECASE)
         if match:
             return match.group(1)
-    match = re.search(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b", text, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    patterns = [
-        r"verification\s+code[:\s]+(\d{4,8})",
-        r"your\s+code[:\s]+(\d{4,8})",
-        r"confirm(?:ation)?\s+code[:\s]+(\d{4,8})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1)
+
+    for haystack in haystacks:
+        if not haystack:
+            continue
+        for match in re.finditer(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b", haystack, re.IGNORECASE):
+            token = match.group(1)
+            if _looks_like_hyphen_code(token):
+                return token
     return None
 
 def generate_username(length=10):
