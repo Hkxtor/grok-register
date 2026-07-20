@@ -489,17 +489,22 @@ def duckmail_get_oai_code(
     raise Exception(f"在 {timeout}s 内未收到验证码邮件")
 
 def _looks_like_hyphen_code(token):
-    """Reject CSS/noise tokens like per-100; keep real codes like VJ6-YE7."""
+    """Reject CSS/noise tokens like per-100; keep real codes like VJ6-YE7 / SQQ-QM4."""
     parts = str(token or "").split("-", 1)
     if len(parts) != 2:
         return False
     left, right = parts
     if len(left) != 3 or len(right) != 3:
         return False
-    # Each side must mix letters and digits (xAI style), not word-only or digit-only.
-    def mixed(part):
-        return any(ch.isalpha() for ch in part) and any(ch.isdigit() for ch in part)
-    return mixed(left) and mixed(right)
+    if not left.isalnum() or not right.isalnum():
+        return False
+    # Noise pattern: pure-letter side + pure-digit side (e.g. per-100, max-100).
+    # Real xAI codes may be mixed on one or both sides (VJ6-YE7, SQQ-QM4).
+    left_alpha, right_alpha = left.isalpha(), right.isalpha()
+    left_digit, right_digit = left.isdigit(), right.isdigit()
+    if (left_alpha and right_digit) or (left_digit and right_alpha):
+        return False
+    return True
 
 
 def extract_verification_code(text, subject=""):

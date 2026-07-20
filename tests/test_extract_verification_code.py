@@ -18,6 +18,15 @@ class ExtractVerificationCodeTests(unittest.TestCase):
             "VJ6-YE7",
         )
 
+    def test_spacexai_subject_letter_heavy_code_sqq_qm4(self):
+        """Cloud Mail 实况：SQQ-QM4 左侧全字母，不得被质量过滤误杀。"""
+        subject = "SpaceXAI confirmation code: SQQ-QM4"
+        body = '<div class="per-100">footer</div>'
+        self.assertEqual(
+            extract_verification_code(body, subject),
+            "SQQ-QM4",
+        )
+
     def test_classic_subject_prefix_xai(self):
         self.assertEqual(
             extract_verification_code("hello", "VJ6-YE7 xAI"),
